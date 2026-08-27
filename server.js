@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import sharp from 'sharp';
 
 const { PORT = 3000, WEBHOOK_SECRET, NOTION_TOKEN, NOTION_DATA_SOURCE_ID, OPENAI_API_KEY } = process.env;
 
@@ -67,6 +68,25 @@ async function handleWebhook(req) {
   await import('node:fs/promises').then((fs) => fs.writeFile(outPath, buffer));
   console.log(`Скриншот скачан и сохранён: ${outPath} (${buffer.length} байт)`);
 
+  const metadata = await sharp(buffer).metadata();
+  console.log(`Реальный размер картинки: ${metadata.width} x ${metadata.height} px`);
+
+  // Обрезаем до верхней содержательной части — фиксированная высота в пикселях
+  // ИСХОДНОГО разрешения (не пропорционально ширине!). При соотношении сторон,
+  // близком к квадрату, OpenAI меньше ужимает картинку перед распознаванием —
+  // а значит текст остаётся крупнее и читаемее.
+  const CROP_HEIGHT = 5200; // увеличили, чтобы захватить описание целиком
+  const cropHeight = Math.min(metadata.height, CROP_HEIGHT);
+  const croppedBuffer = await sharp(buffer)
+    .extract({ left: 0, top: 0, width: metadata.width, height: cropHeight })
+    .png()
+    .toBuffer();
+
+  const croppedPath = './last-cropped-screenshot.png';
+  await import('node:fs/promises').then((fs) => fs.writeFile(croppedPath, croppedBuffer));
+  console.log(`Обрезанная версия (${metadata.width} x ${cropHeight}) сохранена: ${croppedPath}`);
+  console.log('Открой этот файл и проверь глазами — виден ли на нём заголовок И таблица характеристик целиком.');
+
   // --- Проверка дублей ---
   const adId = extractAdId(link);
   console.log('ID объявления из ссылки:', adId);
@@ -88,8 +108,8 @@ async function handleWebhook(req) {
     await updateStatusAndFlags(pageId, 'Processing', []);
     console.log('Записал Status=Processing.');
 
-    console.log('\n--- Отправляю скриншот в gpt-4o-mini ---');
-    const analysis = await analyseScreenshot(buffer, imgResp.headers.get('content-type') || 'image/png');
+    console.log('\n--- Отправляю ОБРЕЗАННЫЙ скриншот в gpt-4o-mini ---');
+    const analysis = await analyseScreenshot(croppedBuffer, 'image/png');
     console.log('--- Ответ модели ---');
     console.log(JSON.stringify(analysis, null, 2));
     console.log('(Пока НЕ записываю это в Notion — просто смотрим, что вернула модель)');
@@ -101,6 +121,19 @@ async function handleWebhook(req) {
 const SYSTEM_PROMPT = `
 Ты анализируешь один скриншот объявления о продаже iPhone с OLX Poland (сайт может быть на польском).
 Отвечай СТРОГО в формате JSON, без markdown-обёртки и без текста до/после JSON.
+
+ВАЖНО про сам скриншот: это скриншот всей страницы OLX целиком. Она может содержать блоки
+"More from this advertiser" / "See also" / рекламу с ДРУГИМИ объявлениями внизу страницы —
+это НЕ то объявление, которое нужно анализировать. Бери данные только из главного блока
+в верхней части: главное фото, заголовок объявления, таблица характеристик
+(Phone model / Built-in memory / Color / Condition / SIM options и т.д.) и текст DESCRIPTION.
+Если что-то из этих данных противоречит миниатюрам в разделах снизу — ориентируйся только
+на главный блок вверху, миниатюры снизу вообще не читай.
+
+Перед тем как заполнить JSON, мысленно (не в ответе) найди и перечитай дважды:
+заголовок объявления и строку "Phone model" в таблице характеристик — модель телефона
+чаще всего указана в ОБОИХ местах, и они должны совпадать. Аналогично для battery% —
+ищи его и в заголовке/таблице характеристик, и в тексте DESCRIPTION.
 
 Схема ответа:
 {
@@ -167,7 +200,7 @@ async function analyseScreenshot(imageBuffer, mimeType) {
         {
           role: 'user',
           content: [
-            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } },
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}`, detail: 'high' } },
           ],
         },
       ],
