@@ -142,8 +142,48 @@ async function writeAnalysisToNotion(pageId, analysis) {
   setSelect('Accessories', analysis.accessories);
   setSelect('FaceID', analysis.faceid);
   setNumber('Price PLN', analysis.price_pln);
+  setNumber('Views', analysis.views);
+
+  // Дата публикации: если модель нашла явную дату — используем её.
+  // Если объявление помечено "Refreshed today"/"Added today" без конкретного
+  // числа — не полагаемся на понимание модели "какое сегодня число", а берём
+  // реальную сегодняшнюю дату с самого сервера.
+  let adPostedOn = analysis.ad_posted_on;
+  if (!adPostedOn && analysis.posted_today) {
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const dd = String(now.getDate()).padStart(2, '0');
+    adPostedOn = `${yyyy}-${mm}-${dd}`;
+  }
+  if (adPostedOn) {
+    properties['Ad posted on'] = { date: { start: adPostedOn } };
+  }
   setSelect('SIM', analysis.sim);
-  setMultiSelect('Info tags', analysis.info_tags);
+
+  const PRODUCT_TAGS = new Set([
+    'Glass cracked',
+    'Visible scratches',
+    'Damaged body',
+    'For parts',
+    'Needs repair',
+    'Some parts replaced (possibly non-original)',
+  ]);
+  const AD_TAGS = new Set([
+    'Account with good reviews',
+    'Account without reviews',
+    'Aged OLX account',
+    'Offers delivery',
+    'Poor description',
+    'Possible reseller/shop',
+    'Rich description',
+    'Too high price',
+    'Too low price',
+    'With warranty',
+  ]);
+  const allTags = analysis.info_tags ?? [];
+  setMultiSelect('Product tags', allTags.filter((t) => PRODUCT_TAGS.has(t)));
+  setMultiSelect('Ad tags', allTags.filter((t) => AD_TAGS.has(t)));
 
   // AI Notes — текстовое поле, куда переносим обоснование модели (что раньше
   // только печаталось в консоль). "AI Notes" в схеме имеет тип rich_text ("text").
@@ -187,6 +227,9 @@ const SYSTEM_PROMPT = `
   "accessories": "одно из: Full kit, W box only, W cable, Phone only, NA",
   "faceid": "одно из: Works, Broken, NA",
   "price_pln": "число или null",
+  "views": "число или null",
+  "ad_posted_on": "дата в формате YYYY-MM-DD или null",
+  "posted_today": "true или false — см. правило ниже",
   "sim": "одно из: Dual SIM, Dual Sim (SIM + eSIM), Dual eSIM, Single SIM, eSIM, NA",
   "info_tags_checklist": [
     { "tag": "Offers delivery", "applies": true, "evidence": "короткая цитата из объявления или пустая строка, если не применимо" },
@@ -202,7 +245,9 @@ const SYSTEM_PROMPT = `
     { "tag": "For parts", "applies": false, "evidence": "" },
     { "tag": "Needs repair", "applies": false, "evidence": "" },
     { "tag": "Some parts replaced (possibly non-original)", "applies": false, "evidence": "" },
-    { "tag": "Possible reseller/shop", "applies": false, "evidence": "" }
+    { "tag": "Possible reseller/shop", "applies": false, "evidence": "" },
+    { "tag": "Visible scratches", "applies": false, "evidence": "" },
+    { "tag": "Damaged body", "applies": false, "evidence": "" }
   ],
   "info_tags": [],
   "flags": [],
@@ -549,6 +594,42 @@ iCloud может быть заблокирован, если человек:
 - "price_pln": null
 
 
+12.5. VIEWS И ДАТА ПУБЛИКАЦИИ
+
+"views" — число просмотров объявления. На странице OLX это подписано "Views: N"
+рядом с "ID: XXXXXXX" — обычно ближе к концу блока объявления, сразу под текстом
+DESCRIPTION, перед разделителем. Указывай только число. Если не видно на скриншоте
+(например обрезано) — "views": null. Не путай с рейтингом продавца ("11 ratings")
+или числом отзывов — это два разных числа в разных местах страницы.
+
+"ad_posted_on" — дата публикации объявления. На странице OLX это подписано
+"Added [Month Day, Year]" или "Refreshed on [Month Day, Year]" — обычно в верхней
+части правой панели, прямо над заголовком объявления и ценой (например
+"Added August 16, 2026").
+
+Переведи эту дату в формат YYYY-MM-DD. Например "Added August 16, 2026" →
+"2026-08-16". Если месяц указан сокращённо или на другом языке (например
+польском) — всё равно переведи в тот же числовой формат.
+
+ОСОБЫЙ СЛУЧАЙ — "сегодня": иногда вместо конкретной даты там написано
+"Refreshed today at HH:MM" / "Added today" / польские аналоги без указания
+числа месяца. В этом случае:
+- "ad_posted_on": null (ты не обязан знать, какое сегодня число);
+- "posted_today": true.
+
+Если указана конкретная дата (не "today") — "posted_today": false, и дату
+записывай в "ad_posted_on" как обычно.
+
+Если ни дата, ни упоминание "сегодня" не найдены — "ad_posted_on": null,
+"posted_today": false.
+
+Не путай "Added [дата]" (дата публикации объявления) с "On OLX since [дата]"
+(дата создания аккаунта продавца, используется отдельно для тега
+"Aged OLX account", см. раздел про Info tags) — это два разных значения.
+
+Если дату невозможно определить — "ad_posted_on": null.
+
+
 13. SIM
 
 Допустимые значения:
@@ -581,7 +662,7 @@ iCloud может быть заблокирован, если человек:
 14. INFO TAGS — ОБЯЗАТЕЛЬНЫЙ ПОШАГОВЫЙ ПРОХОД (CHECKLIST)
 
 ВАЖНО: не пытайся сразу решить, какие теги применимы. Сначала заполни "info_tags_checklist" —
-пройдись ПО ОЧЕРЕДИ по КАЖДОМУ из 14 тегов ниже, для каждого явно реши applies: true/false
+пройдись ПО ОЧЕРЕДИ по КАЖДОМУ из 16 тегов ниже, для каждого явно реши applies: true/false
 и укажи короткую цитату (или пересказ в несколько слов) из объявления как evidence,
 подтверждающую твоё решение. Если applies: false — evidence оставь пустой строкой.
 Не пропускай ни один тег из списка, даже если ответ очевидно "false".
@@ -590,7 +671,7 @@ iCloud может быть заблокирован, если человек:
 tag, у которых applies: true в checklist. Значения в info_tags и info_tags_checklist
 должны быть согласованы друг с другом.
 
-Допустимые значения (ровно эти 14, по одному разу каждый в checklist):
+Допустимые значения (ровно эти 16, по одному разу каждый в checklist):
 
 - Offers delivery
 - Rich description
@@ -606,6 +687,8 @@ tag, у которых applies: true в checklist. Значения в info_tags
 - Needs repair
 - Some parts replaced (possibly non-original)
 - Possible reseller/shop
+- Visible scratches
+- Damaged body
 
 Правила:
 
@@ -694,6 +777,30 @@ tag, у которых applies: true в checklist. Значения в info_tags
 
 "Some parts replaced (possibly non-original)" не означает автоматически "Needs repair" или "For parts".
 Телефон после замены детали может находиться в отличном состоянии.
+
+"Visible scratches":
+- если на теле/экране/задней панели телефона есть заметные царапины или
+  потёртости — упомянуто в DESCRIPTION явным текстом, или явно видно на фото;
+- НЕ применяется, если стекло/экран треснуто (это "Glass cracked", отдельный
+  тег и более серьёзная проблема, не дублируй).
+
+Обрати внимание: этот тег может совпадать по смыслу с описанием Grade C
+("visible scratches, hit marks, scuffs, but screen/glass is not cracked") —
+это нормально и ожидаемо. Ставь тег на основании конкретных фактов из
+объявления независимо от того, какой итоговый Grade получился.
+
+"Damaged body":
+- если у телефона повреждён именно КОРПУС/РАМКА (вмятины, погнутый корпус,
+  сколы/трещины на металлическом или пластиковом ободе, отломанные углы) —
+  упомянуто явным текстом или явно видно на фото;
+- НЕ используй этот тег для повреждений экрана/заднего стекла (это "Glass
+  cracked") и не используй его просто для обычных косметических царапин без
+  вмятин/деформации (это "Visible scratches").
+
+Эти три тега про физическое состояние — "Glass cracked", "Visible scratches",
+"Damaged body" — независимы друг от друга и могут применяться одновременно,
+если у телефона несколько разных проблем сразу (например треснувшее стекло
+И погнутый корпус).
 
 "Possible reseller/shop":
 - если на фотографиях объявления видно НЕСКОЛЬКО РАЗНЫХ телефонов (разных
@@ -825,7 +932,7 @@ tag, у которых applies: true в checklist. Значения в info_tags
 - FaceID входит в разрешённый список.
 - SIM входит в разрешённый список.
 - Info tags содержат только разрешённые значения.
-- info_tags_checklist содержит ровно 13 тегов, по одному разу каждый.
+- info_tags_checklist содержит ровно 16 тегов, по одному разу каждый.
 - info_tags точно соответствует тегам с applies: true в info_tags_checklist.
 - Flags содержат только разрешённые значения.
 - Если проблем нет, flags = ["All good"].
